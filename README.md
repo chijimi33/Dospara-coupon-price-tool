@@ -66,7 +66,7 @@ No third-party packages are required.
 
 ## GitHub Actions publishing
 
-The workflow in `.github/workflows/publish-dospara-coupons.yml` runs every 6 hours and publishes static files to GitHub Pages:
+The workflow in `.github/workflows/publish-dospara-coupons.yml` runs every 6 hours and commits static files under `public/`:
 
 - `dospara_coupons.json`
 - `dospara_coupons.csv`
@@ -74,18 +74,18 @@ The workflow in `.github/workflows/publish-dospara-coupons.yml` runs every 6 hou
 
 It can also be started manually from the GitHub Actions tab with `workflow_dispatch`.
 
-After pushing this repository to GitHub:
-
-1. Open the repository on GitHub.
-2. Go to `Settings` -> `Pages`.
-3. Set `Build and deployment` -> `Source` to `GitHub Actions`.
-4. Go to `Actions` -> `Publish Dospara coupon data`.
-5. Run the workflow once manually.
-
-The JSON URL will be:
+The JSON URL for ChatGPT Tasks is:
 
 ```text
-https://<github-user>.github.io/<repository-name>/dospara_coupons.json
+https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json
 ```
 
-Use that URL in the ChatGPT task rule as the Dospara coupon helper JSON.
+After pushing this repository to GitHub, run `Update Dospara coupon data` once manually from the GitHub Actions tab.
+
+If the workflow cannot push generated files, open:
+
+```text
+Settings -> Actions -> General -> Workflow permissions
+```
+
+Then set it to `Read and write permissions`.
