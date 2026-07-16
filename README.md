@@ -105,13 +105,25 @@ The JSON URL for ChatGPT Tasks is:
 https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json
 ```
 
-When using this URL from ChatGPT Tasks, append a unique cache-busting query string for each run so the task does not reuse a stale fetched copy:
+For ChatGPT Tasks, the most reliable fetch flow is to resolve the current `main` commit first and then fetch the commit-pinned raw file. This avoids stale `raw.githubusercontent.com/.../main/...` cache responses:
+
+```text
+https://api.github.com/repos/chijimi33/Dospara-coupon-price-tool/git/ref/heads/main
+```
+
+Extract `object.sha`, then fetch:
+
+```text
+https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/{object.sha}/public/dospara_coupons.json
+```
+
+If the task must use the branch URL directly, append a unique cache-busting query string for each run:
 
 ```text
 https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json?cache_bust=YYYYMMDDHHmm
 ```
 
-If `fetched_at` is more than 12 hours old, retry once with a new `cache_bust` value before treating the data as stale.
+If `fetched_at` is more than 12 hours old, retry using the commit-pinned flow above before treating the data as stale.
 
 After pushing this repository to GitHub, run `Update Dospara coupon data` once manually from the GitHub Actions tab.
 
