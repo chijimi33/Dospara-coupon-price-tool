@@ -38,6 +38,7 @@ def build_public_data(output_dir: Path) -> dict[str, Any]:
 def render_index(result: dict[str, Any]) -> str:
     page = result.get("page") or {}
     pages = result.get("pages") or []
+    verification = result.get("coupon_verification") or {}
     items = result.get("items") or []
     sample_rows = "\n".join(render_item_row(item) for item in items[:10])
 
@@ -65,6 +66,8 @@ def render_index(result: dict[str, Any]) -> str:
     <li>Page title: {escape(page.get("title"))}</li>
     <li>Campaign end text: {escape(page.get("campaign_end_text"))}</li>
     <li>Item count: {len(items)}</li>
+    <li>Product-page coupon verification: {escape("enabled" if verification.get("enabled") else "disabled")}</li>
+    <li>Rejected stale coupon cards: {escape(verification.get("rejected_item_count", 0))}</li>
   </ul>
   {render_source_list(pages)}
   <p>
@@ -99,7 +102,8 @@ def render_source_list(pages: list[dict[str, Any]]) -> str:
 
     rows = "\n".join(
         f'<li><a href="{escape_attr(page.get("source_url"))}">{escape(page.get("title") or page.get("source_url"))}</a>'
-        f' ({escape(page.get("campaign_end_text"))}, {escape(page.get("count"))} items)</li>'
+        f' ({escape(page.get("campaign_end_text"))}, {escape(page.get("count"))} verified'
+        f' / {escape(page.get("parsed_count", page.get("count")))} parsed)</li>'
         for page in pages
     )
     return f"""<h2>Sources</h2>

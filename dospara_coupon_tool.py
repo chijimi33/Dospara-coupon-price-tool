@@ -58,6 +58,8 @@ CSV_FIELDS = [
     "coupon_discount_yen",
     "coupon_price_yen",
     "coupon_code",
+    "coupon_verified",
+    "coupon_verification_error",
     "stock",
     "product_url",
 ]
@@ -107,6 +109,10 @@ class CouponItem:
     campaign_title: str | None = None
     campaign_updated_text: str | None = None
     campaign_end_text: str | None = None
+    coupon_verified: bool | None = None
+    coupon_verification_error: str | None = None
+    coupon_verification_source_url: str | None = None
+    product_page_coupon_expire_text: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -121,6 +127,10 @@ class CouponItem:
             "coupon_discount_yen": self.coupon_discount_yen,
             "coupon_price_yen": self.coupon_price_yen,
             "coupon_code": self.coupon_code,
+            "coupon_verified": self.coupon_verified,
+            "coupon_verification_error": self.coupon_verification_error,
+            "coupon_verification_source_url": self.coupon_verification_source_url,
+            "product_page_coupon_expire_text": self.product_page_coupon_expire_text,
             "stock": self.stock,
             "product_url": self.product_url,
             "image_url": self.image_url,
@@ -146,6 +156,15 @@ class CampaignCandidate:
             "item_count": self.item_count,
             "error": self.error,
         }
+
+
+@dataclass
+class ProductPageCoupon:
+    product_id: str
+    amount_yen: int
+    coupon_code: str
+    campaign_key: str | None = None
+    expire_text: str | None = None
 
 
 @dataclass
@@ -663,6 +682,109 @@ def enrich_items(
     return items
 
 
+def strip_javascript_comments(script_text: str) -> str:
+    without_block_comments = re.sub(r"/\*.*?\*/", "", script_text, flags=re.DOTALL)
+    return re.sub(r"(?m)^\s*//.*$", "", without_block_comments)
+
+
+def extract_product_page_coupon(product_html: str, product_id: str) -> ProductPageCoupon | None:
+    script_text = strip_javascript_comments(product_html)
+    case_re = re.compile(
+        rf"case\s+['\"]{re.escape(product_id)}['\"]\s*:(?P<body>.*?)(?:break\s*;)",
+        flags=re.DOTALL,
+    )
+
+    for match in case_re.finditer(script_text):
+        body = match.group("body")
+        amount_match = re.search(r"productMap\.amount\s*=\s*['\"](\d+)['\"]", body)
+        code_match = re.search(r"productMap\.couponcode\s*=\s*['\"]([^'\"]+)['\"]", body)
+        if not amount_match or not code_match:
+            continue
+
+        campaign_key = extract_product_map_string(body, "campaign")
+        return ProductPageCoupon(
+            product_id=product_id,
+            amount_yen=int(amount_match.group(1)),
+            coupon_code=code_match.group(1).strip(),
+            campaign_key=campaign_key,
+            expire_text=extract_campaign_expire_text(script_text, campaign_key),
+        )
+
+    return None
+
+
+def extract_product_map_string(script_body: str, field_name: str) -> str | None:
+    match = re.search(rf"productMap\.{re.escape(field_name)}\s*=\s*['\"]([^'\"]+)['\"]", script_body)
+    return match.group(1).strip() if match else None
+
+
+def extract_campaign_expire_text(script_text: str, campaign_key: str | None) -> str | None:
+    if not campaign_key:
+        return None
+
+    match = re.search(rf"['\"]{re.escape(campaign_key)}['\"]\s*:\s*['\"]([^'\"]+)['\"]", script_text)
+    return match.group(1).strip() if match else None
+
+
+def verify_product_page_coupons(
+    items: list[CouponItem],
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    cafile: str | None = None,
+    insecure_tls: bool = False,
+    fetcher: Callable[..., str] = fetch_text,
+) -> list[CouponItem]:
+    verified_items: list[CouponItem] = []
+
+    for item in items:
+        item.coupon_verified = False
+        item.coupon_verification_source_url = item.product_url
+
+        if not item.product_url:
+            item.coupon_verification_error = "missing product_url"
+            continue
+        if not item.coupon_code:
+            item.coupon_verification_error = "missing coupon_code"
+            continue
+
+        try:
+            product_html = fetch_with_options(
+                fetcher,
+                item.product_url,
+                timeout=timeout,
+                cafile=cafile,
+                insecure_tls=insecure_tls,
+            )
+        except (OSError, urllib.error.URLError) as exc:
+            item.coupon_verification_error = f"product page fetch failed: {exc}"
+            continue
+
+        product_coupon = extract_product_page_coupon(product_html, item.product_id)
+        if product_coupon is None:
+            item.coupon_verification_error = "coupon not active on product page"
+            continue
+
+        if product_coupon.amount_yen != item.coupon_discount_yen:
+            item.coupon_verification_error = (
+                f"coupon amount mismatch: campaign={item.coupon_discount_yen}, "
+                f"product_page={product_coupon.amount_yen}"
+            )
+            continue
+
+        if product_coupon.coupon_code != item.coupon_code:
+            item.coupon_verification_error = (
+                f"coupon code mismatch: campaign={item.coupon_code}, product_page={product_coupon.coupon_code}"
+            )
+            continue
+
+        item.coupon_verified = True
+        item.coupon_verification_error = None
+        item.product_page_coupon_expire_text = product_coupon.expire_text
+        verified_items.append(item)
+
+    return verified_items
+
+
 def parse_int(value: Any) -> int | None:
     if value is None:
         return None
@@ -743,6 +865,40 @@ def dedupe_coupon_items(items: list[CouponItem]) -> list[CouponItem]:
     return deduped
 
 
+def update_page_counts_after_verification(
+    pages: list[dict[str, Any]],
+    verified_items: list[CouponItem],
+    rejected_items: list[CouponItem],
+    *,
+    verification_enabled: bool,
+) -> None:
+    if not verification_enabled:
+        for page in pages:
+            page["parsed_count"] = page.get("count", 0)
+            page["verified_count"] = page.get("count", 0)
+            page["rejected_count"] = 0
+        return
+
+    verified_counts = count_items_by_campaign_source(verified_items)
+    rejected_counts = count_items_by_campaign_source(rejected_items)
+    for page in pages:
+        source_url = page.get("source_url")
+        parsed_count = page.get("count", 0)
+        verified_count = verified_counts.get(source_url, 0)
+        rejected_count = rejected_counts.get(source_url, 0)
+        page["parsed_count"] = parsed_count
+        page["verified_count"] = verified_count
+        page["rejected_count"] = rejected_count
+        page["count"] = verified_count
+
+
+def count_items_by_campaign_source(items: list[CouponItem]) -> dict[str | None, int]:
+    counts: dict[str | None, int] = {}
+    for item in items:
+        counts[item.campaign_source_url] = counts.get(item.campaign_source_url, 0) + 1
+    return counts
+
+
 def get_dospara_coupon_prices(
     page_url: str | None = AUTO_PAGE_URL,
     *,
@@ -755,6 +911,7 @@ def get_dospara_coupon_prices(
     insecure_tls: bool = False,
     discovery_start_urls: list[str] | None = None,
     max_discovery_candidates: int = DEFAULT_MAX_DISCOVERY_CANDIDATES,
+    verify_product_page_coupons_enabled: bool = True,
     fetcher: Callable[..., str] = fetch_text,
 ) -> dict[str, Any]:
     discovery: PageDiscovery | None = None
@@ -798,6 +955,29 @@ def get_dospara_coupon_prices(
         )
         enrich_items(items, product_info, page_url=resolved_page_url)
 
+    parsed_item_count = len(items)
+    verification_enabled = bool(fetch_prices and verify_product_page_coupons_enabled and items)
+    verified_item_count = 0
+    rejected_items: list[CouponItem] = []
+    if verification_enabled:
+        parsed_items = items
+        items = verify_product_page_coupons(
+            items,
+            timeout=timeout,
+            cafile=cafile,
+            insecure_tls=insecure_tls,
+            fetcher=fetcher,
+        )
+        verified_item_count = len(items)
+        rejected_items = [item for item in parsed_items if item.coupon_verified is not True]
+
+    update_page_counts_after_verification(
+        pages,
+        items,
+        rejected_items,
+        verification_enabled=verification_enabled,
+    )
+
     if in_stock_only:
         items = [item for item in items if "在庫なし" not in (item.stock or "")]
 
@@ -811,6 +991,15 @@ def get_dospara_coupon_prices(
         "page": {key: value for key, value in primary_page.items() if key != "count"},
         "pages": pages,
         "discovery": discovery.to_record() if discovery else {"enabled": False},
+        "coupon_verification": {
+            "enabled": verification_enabled,
+            "source": "product_page",
+            "strict": verification_enabled,
+            "parsed_item_count": parsed_item_count,
+            "verified_item_count": verified_item_count,
+            "rejected_item_count": len(rejected_items),
+            "rejected_items": [item.to_record() for item in rejected_items],
+        },
         "count": len(records),
         "items": records,
     }
@@ -869,6 +1058,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", help="Write output to this file instead of stdout")
     parser.add_argument("--html-file", help="Read campaign HTML from a local file instead of fetching it")
     parser.add_argument("--no-api", action="store_true", help="Do not call the product API")
+    parser.add_argument(
+        "--no-product-page-verification",
+        action="store_true",
+        help="Do not verify campaign coupons against each product page before output",
+    )
     parser.add_argument("--in-stock-only", action="store_true", help="Drop items whose stock text contains '在庫なし'")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Product API batch size")
@@ -924,6 +1118,7 @@ def main(argv: list[str] | None = None) -> int:
             insecure_tls=args.insecure_tls,
             discovery_start_urls=args.discovery_urls,
             max_discovery_candidates=args.max_discovery_candidates,
+            verify_product_page_coupons_enabled=not args.no_product_page_verification,
         )
         rendered = render_result(result, args.format, indent=args.indent)
 

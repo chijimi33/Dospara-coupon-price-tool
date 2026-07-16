@@ -4,8 +4,10 @@ from dospara_coupon_tool import (
     DEFAULT_PAGE_URL,
     discover_coupon_page,
     enrich_items,
+    extract_product_page_coupon,
     get_dospara_coupon_prices,
     parse_coupon_items,
+    verify_product_page_coupons,
 )
 
 
@@ -59,6 +61,38 @@ class DosparaCouponToolTest(unittest.TestCase):
             """,
             "https://www.dospara.co.jp/goods/parts": "<html><title>Parts category</title></html>",
             "https://www.dospara.co.jp/event/gaming_pc_sale.html": "<html><title>PC sale</title></html>",
+        }
+        if url not in pages:
+            raise OSError(f"Unexpected URL: {url}")
+        return pages[url]
+
+    def fake_product_page_fetcher(self, url, **_kwargs):
+        pages = {
+            "https://www.dospara.co.jp/SBR1/IC111111.html": """
+            <script>
+              switch (productJson.productID) {
+                case 'IC111111':
+                  productMap.amount = '5000';
+                  productMap.couponcode = 'LIVEA';
+                  productMap.campaign = 'campaign-weekly';
+                  break;
+              }
+              const campaignDeadlines = {
+                "campaign-weekly": "2026年7月17日(金) 16:59",
+              };
+            </script>
+            """,
+            "https://www.dospara.co.jp/SBR1/IC222222.html": """
+            <script>
+              switch (productJson.productID) {
+                // case 'IC222222':
+                //   productMap.amount = '1000';
+                //   productMap.couponcode = 'LIVEB';
+                //   productMap.campaign = 'campaign-weekly';
+                //   break;
+              }
+            </script>
+            """,
         }
         if url not in pages:
             raise OSError(f"Unexpected URL: {url}")
@@ -126,6 +160,59 @@ class DosparaCouponToolTest(unittest.TestCase):
         self.assertEqual(record["coupon_price_yen"], 14800)
         self.assertEqual(record["product_name"], "Sample Product")
         self.assertEqual(record["product_url"], "https://www.dospara.co.jp/SBR1/IC111111.html")
+
+    def test_extract_product_page_coupon_ignores_commented_out_case(self):
+        active_html = self.fake_product_page_fetcher("https://www.dospara.co.jp/SBR1/IC111111.html")
+        ended_html = self.fake_product_page_fetcher("https://www.dospara.co.jp/SBR1/IC222222.html")
+
+        active_coupon = extract_product_page_coupon(active_html, "IC111111")
+        ended_coupon = extract_product_page_coupon(ended_html, "IC222222")
+
+        self.assertIsNotNone(active_coupon)
+        self.assertEqual(active_coupon.amount_yen, 5000)
+        self.assertEqual(active_coupon.coupon_code, "LIVEA")
+        self.assertEqual(active_coupon.expire_text, "2026年7月17日(金) 16:59")
+        self.assertIsNone(ended_coupon)
+
+    def test_verify_product_page_coupons_drops_campaign_cards_missing_from_product_page(self):
+        items = parse_coupon_items(
+            """
+            <h2 class="section-title"><span>Weekly coupons</span></h2>
+            <li class="model-card get_product_data" data-code="IC111111">
+              <div class="coupon-wrapper coupon-5000">
+                <div class="coupon-code__text">LIVEA</div>
+              </div>
+            </li>
+            <li class="model-card get_product_data" data-code="IC222222">
+              <div class="coupon-wrapper coupon-1000">
+                <div class="coupon-code__text">LIVEB</div>
+              </div>
+            </li>
+            """
+        )
+        product_info = {
+            "IC111111": {
+                "productID": "IC111111",
+                "pname": "Active Product",
+                "amttax": 19800,
+                "url": "/SBR1/IC111111.html",
+            },
+            "IC222222": {
+                "productID": "IC222222",
+                "pname": "Ended Product",
+                "amttax": 9800,
+                "url": "/SBR1/IC222222.html",
+            },
+        }
+
+        enrich_items(items, product_info, page_url="https://www.dospara.co.jp/event/example.html")
+        verified_items = verify_product_page_coupons(items, fetcher=self.fake_product_page_fetcher)
+
+        self.assertEqual([item.product_id for item in verified_items], ["IC111111"])
+        self.assertTrue(verified_items[0].coupon_verified)
+        self.assertEqual(verified_items[0].product_page_coupon_expire_text, "2026年7月17日(金) 16:59")
+        self.assertFalse(items[1].coupon_verified)
+        self.assertEqual(items[1].coupon_verification_error, "coupon not active on product page")
 
     def test_discover_coupon_page_selects_current_campaign_from_campaign_list(self):
         discovery = discover_coupon_page(

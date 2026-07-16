@@ -24,10 +24,15 @@ The output includes:
 - `campaign_source_url`: campaign page each item came from
 - `campaign_title`
 - `campaign_end_text`
+- `coupon_verified`: `true` only when the same coupon is active on the product page
+- `coupon_verification_error`: reason a parsed campaign card was rejected, included under `coupon_verification.rejected_items`
 - `source_url`: primary campaign page for this run
 - `source_urls`: all campaign pages used for this run
 - `pages`: per-campaign metadata and item counts
+- `coupon_verification`: product-page verification summary
 - `discovery`: inspected candidate pages and whether the fallback URL was used
+
+Campaign pages can retain stale coupon cards after a quantity-limited coupon ends. By default the tool verifies every parsed campaign coupon against the product page and only outputs items where the product page still contains the same active product ID, coupon code, and discount amount. Rejected stale cards are reported in `coupon_verification.rejected_items`.
 
 ## Usage
 
@@ -57,6 +62,12 @@ Only parse the HTML and skip the product API:
 
 ```bash
 python3 dospara_coupon_tool.py --no-api
+```
+
+Skip product-page coupon verification:
+
+```bash
+python3 dospara_coupon_tool.py --no-product-page-verification
 ```
 
 Add another page to scan during auto discovery:
