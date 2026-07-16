@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build static files for GitHub Pages."""
+"""Build static public data files."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ def build_public_data(output_dir: Path) -> dict[str, Any]:
 
 def render_index(result: dict[str, Any]) -> str:
     page = result.get("page") or {}
+    pages = result.get("pages") or []
     items = result.get("items") or []
     sample_rows = "\n".join(render_item_row(item) for item in items[:10])
 
@@ -58,12 +59,14 @@ def render_index(result: dict[str, Any]) -> str:
   <h1>Dospara Coupon Data</h1>
   <p>ドスパラ公式セールページから抽出したクーポン補助データです。</p>
   <ul>
-    <li>Source: <a href="{escape_attr(result.get("source_url"))}">{escape(result.get("source_url"))}</a></li>
+    <li>Primary source: <a href="{escape_attr(result.get("source_url"))}">{escape(result.get("source_url"))}</a></li>
+    <li>Source count: {len(pages)}</li>
     <li>Fetched at: <code>{escape(result.get("fetched_at"))}</code></li>
     <li>Page title: {escape(page.get("title"))}</li>
     <li>Campaign end text: {escape(page.get("campaign_end_text"))}</li>
     <li>Item count: {len(items)}</li>
   </ul>
+  {render_source_list(pages)}
   <p>
     <a href="./dospara_coupons.json">dospara_coupons.json</a>
     /
@@ -74,6 +77,7 @@ def render_index(result: dict[str, Any]) -> str:
     <thead>
       <tr>
         <th>Product</th>
+        <th>Campaign</th>
         <th>Regular</th>
         <th>Coupon</th>
         <th>After coupon</th>
@@ -89,6 +93,21 @@ def render_index(result: dict[str, Any]) -> str:
 """
 
 
+def render_source_list(pages: list[dict[str, Any]]) -> str:
+    if not pages:
+        return ""
+
+    rows = "\n".join(
+        f'<li><a href="{escape_attr(page.get("source_url"))}">{escape(page.get("title") or page.get("source_url"))}</a>'
+        f' ({escape(page.get("campaign_end_text"))}, {escape(page.get("count"))} items)</li>'
+        for page in pages
+    )
+    return f"""<h2>Sources</h2>
+  <ul>
+    {rows}
+  </ul>"""
+
+
 def render_item_row(item: dict[str, Any]) -> str:
     product_name = item.get("product_name") or item.get("product_id") or ""
     product_url = item.get("product_url") or ""
@@ -96,6 +115,7 @@ def render_item_row(item: dict[str, Any]) -> str:
 
     return f"""<tr>
         <td>{product_cell}</td>
+        <td>{escape(item.get("campaign_title"))}<br><a href="{escape_attr(item.get("campaign_source_url"))}">source</a></td>
         <td>{format_yen(item.get("regular_price_yen"))}</td>
         <td>{format_yen(item.get("coupon_discount_yen"))}<br><code>{escape(item.get("coupon_code"))}</code></td>
         <td>{format_yen(item.get("coupon_price_yen"))}</td>
@@ -125,7 +145,7 @@ def escape_attr(value: Any) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build GitHub Pages files for Dospara coupon data.")
+    parser = argparse.ArgumentParser(description="Build public files for Dospara coupon data.")
     parser.add_argument("--output-dir", default="public", type=Path)
     args = parser.parse_args()
 

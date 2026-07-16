@@ -22,12 +22,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
+AUTO_PAGE_URL = "auto"
 DEFAULT_PAGE_URL = "https://www.dospara.co.jp/event/diy_parts_accessory.html"
+DEFAULT_DISCOVERY_START_URLS = [
+    "https://www.dospara.co.jp/campaign-list",
+]
 DEFAULT_TIMEOUT = 20.0
 DEFAULT_BATCH_SIZE = 50
+DEFAULT_MAX_DISCOVERY_CANDIDATES = 24
+DISCOVERY_MIN_SCORE = 35
 COMMON_CA_BUNDLES = [
     "/etc/ssl/cert.pem",
     "/opt/homebrew/etc/openssl@3/cert.pem",
@@ -42,6 +48,9 @@ USER_AGENT = (
 )
 
 CSV_FIELDS = [
+    "campaign_source_url",
+    "campaign_title",
+    "campaign_end_text",
     "section",
     "product_id",
     "product_name",
@@ -51,6 +60,33 @@ CSV_FIELDS = [
     "coupon_code",
     "stock",
     "product_url",
+]
+
+DISCOVERY_KEYWORD_SCORES = [
+    ("diy_parts_accessory", 80),
+    ("PCパーツ", 45),
+    ("周辺機器", 45),
+    ("自作PC", 35),
+    ("パーツ", 28),
+    ("週替わり", 28),
+    ("クーポン", 28),
+    ("大決算", 24),
+    ("強化祭り", 24),
+    ("自作", 24),
+    ("数量限定", 22),
+    ("値引き", 18),
+    ("セール", 18),
+    ("SALE", 18),
+    ("キャンペーン", 16),
+    ("おすすめ", 10),
+]
+
+DISCOVERY_NEGATIVE_KEYWORD_SCORES = [
+    ("中古買取", 80),
+    ("買取", 70),
+    ("サポート", 50),
+    ("修理", 50),
+    ("法人", 40),
 ]
 
 
@@ -67,9 +103,17 @@ class CouponItem:
     product_url: str | None = None
     image_url: str | None = None
     simple_spec: str | None = None
+    campaign_source_url: str | None = None
+    campaign_title: str | None = None
+    campaign_updated_text: str | None = None
+    campaign_end_text: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         return {
+            "campaign_source_url": self.campaign_source_url,
+            "campaign_title": self.campaign_title,
+            "campaign_updated_text": self.campaign_updated_text,
+            "campaign_end_text": self.campaign_end_text,
             "section": self.section,
             "product_id": self.product_id,
             "product_name": self.product_name,
@@ -81,6 +125,56 @@ class CouponItem:
             "product_url": self.product_url,
             "image_url": self.image_url,
             "simple_spec": self.simple_spec,
+        }
+
+
+@dataclass
+class CampaignCandidate:
+    url: str
+    text: str | None
+    score: int
+    source_url: str
+    item_count: int | None = None
+    error: str | None = None
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "text": self.text,
+            "score": self.score,
+            "source_url": self.source_url,
+            "item_count": self.item_count,
+            "error": self.error,
+        }
+
+
+@dataclass
+class PageDiscovery:
+    selected_url: str
+    html_text: str
+    start_urls: list[str]
+    selected_candidate: CampaignCandidate | None
+    selected_urls: list[str]
+    selected_candidates: list[CampaignCandidate]
+    inspected_candidates: list[CampaignCandidate]
+    candidate_count: int
+    page_html_by_url: dict[str, str]
+    fallback_used: bool = False
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "start_urls": self.start_urls,
+            "selected_url": self.selected_url,
+            "selected_urls": self.selected_urls,
+            "selected_text": self.selected_candidate.text if self.selected_candidate else None,
+            "selected_score": self.selected_candidate.score if self.selected_candidate else None,
+            "selected_item_count": self.selected_candidate.item_count if self.selected_candidate else None,
+            "coupon_page_count": len(self.selected_candidates),
+            "selected_pages": [candidate.to_record() for candidate in self.selected_candidates],
+            "candidate_count": self.candidate_count,
+            "fallback_used": self.fallback_used,
+            "inspected_candidates": [candidate.to_record() for candidate in self.inspected_candidates],
         }
 
 
@@ -249,6 +343,254 @@ def parse_coupon_items(page_html: str) -> list[CouponItem]:
     return items
 
 
+def is_auto_page_url(page_url: str | None) -> bool:
+    return page_url is None or page_url.strip().lower() == AUTO_PAGE_URL or not page_url.strip()
+
+
+def extract_anchor_text(inner_html: str) -> str | None:
+    text_parts = [clean_text(inner_html)]
+    for image_match in re.finditer(r"<img\b([^>]*)>", inner_html, flags=re.IGNORECASE | re.DOTALL):
+        attrs = parse_attrs(image_match.group(1))
+        text_parts.extend([attrs.get("alt", ""), attrs.get("title", "")])
+
+    text = clean_text(" ".join(part for part in text_parts if part))
+    return text or None
+
+
+def is_dospara_page_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    if host and host != "www.dospara.co.jp":
+        return False
+
+    lower_path = parsed.path.lower()
+    if lower_path.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".css", ".js", ".pdf", ".zip")):
+        return False
+    if lower_path.startswith("/s/dospara/api/"):
+        return False
+
+    return True
+
+
+def normalize_campaign_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    return urllib.parse.urlunparse(parsed._replace(query="", fragment=""))
+
+
+def score_campaign_link(text: str | None, url: str) -> int:
+    if not is_dospara_page_url(url):
+        return 0
+
+    parsed = urllib.parse.urlparse(url)
+    haystack = f"{text or ''} {parsed.path} {parsed.query}".lower()
+    score = 0
+    for keyword, points in DISCOVERY_KEYWORD_SCORES:
+        if keyword.lower() in haystack:
+            score += points
+    for keyword, points in DISCOVERY_NEGATIVE_KEYWORD_SCORES:
+        if keyword.lower() in haystack:
+            score -= points
+
+    if parsed.path.startswith("/event/"):
+        score += 12
+    elif parsed.path.startswith("/contents/"):
+        score += 4
+
+    return max(score, 0)
+
+
+def extract_campaign_candidates(page_html: str, base_url: str) -> list[CampaignCandidate]:
+    markup = strip_html_comments(page_html)
+    candidates: list[CampaignCandidate] = []
+    anchor_re = re.compile(r"<a\b([^>]*)>(.*?)</a>", flags=re.IGNORECASE | re.DOTALL)
+
+    for match in anchor_re.finditer(markup):
+        attrs = parse_attrs(match.group(1))
+        href = attrs.get("href")
+        if not href:
+            continue
+
+        href = href.strip()
+        if href.startswith("#") or href.lower().startswith(("javascript:", "mailto:", "tel:")):
+            continue
+
+        url = absolute_url(href, base_url)
+        if not url:
+            continue
+        url = normalize_campaign_url(url)
+
+        text = extract_anchor_text(match.group(2))
+        score = score_campaign_link(text, url)
+        if score < DISCOVERY_MIN_SCORE:
+            continue
+
+        candidates.append(CampaignCandidate(url=url, text=text, score=score, source_url=base_url))
+
+    return candidates
+
+
+def merge_campaign_candidate(
+    candidates_by_url: dict[str, CampaignCandidate],
+    candidate: CampaignCandidate,
+) -> None:
+    candidate.url = normalize_campaign_url(candidate.url)
+    existing = candidates_by_url.get(candidate.url)
+    if existing is None:
+        candidates_by_url[candidate.url] = candidate
+        return
+
+    if candidate.score > existing.score:
+        existing.score = candidate.score
+        existing.text = candidate.text or existing.text
+        existing.source_url = candidate.source_url
+
+    if existing.item_count is None and candidate.item_count is not None:
+        existing.item_count = candidate.item_count
+
+
+def fetch_with_options(
+    fetcher: Callable[..., str],
+    url: str,
+    *,
+    timeout: float,
+    cafile: str | None,
+    insecure_tls: bool,
+) -> str:
+    return fetcher(url, timeout=timeout, cafile=cafile, insecure_tls=insecure_tls)
+
+
+def discover_coupon_page(
+    *,
+    start_urls: list[str] | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    cafile: str | None = None,
+    insecure_tls: bool = False,
+    max_candidates: int = DEFAULT_MAX_DISCOVERY_CANDIDATES,
+    fetcher: Callable[..., str] = fetch_text,
+) -> PageDiscovery:
+    resolved_start_urls = list(dict.fromkeys(start_urls or DEFAULT_DISCOVERY_START_URLS))
+    candidates_by_url: dict[str, CampaignCandidate] = {}
+    page_cache: dict[str, str] = {}
+
+    for start_url in resolved_start_urls:
+        try:
+            start_html = fetch_with_options(
+                fetcher,
+                start_url,
+                timeout=timeout,
+                cafile=cafile,
+                insecure_tls=insecure_tls,
+            )
+        except (OSError, urllib.error.URLError):
+            continue
+
+        page_cache[start_url] = start_html
+        start_items = parse_coupon_items(start_html)
+        if start_items:
+            title = extract_page_meta(start_html).get("title")
+            merge_campaign_candidate(
+                candidates_by_url,
+                CampaignCandidate(
+                    url=start_url,
+                    text=title,
+                    score=max(score_campaign_link(title, start_url), DISCOVERY_MIN_SCORE),
+                    source_url=start_url,
+                    item_count=len(start_items),
+                ),
+            )
+
+        for candidate in extract_campaign_candidates(start_html, start_url):
+            merge_campaign_candidate(candidates_by_url, candidate)
+
+    campaign_list_sources = {
+        url for url in resolved_start_urls if urllib.parse.urlparse(url).path.rstrip("/") == "/campaign-list"
+    }
+    candidates = sorted(
+        candidates_by_url.values(),
+        key=lambda candidate: (
+            candidate.source_url in campaign_list_sources and candidate.source_url != candidate.url,
+            candidate.score,
+            candidate.item_count or 0,
+            candidate.url,
+        ),
+        reverse=True,
+    )
+
+    inspected: list[CampaignCandidate] = []
+    selected_candidates: list[CampaignCandidate] = []
+    page_html_by_url: dict[str, str] = {}
+    for candidate in candidates[: max(1, max_candidates)]:
+        try:
+            page_html = page_cache.get(candidate.url)
+            if page_html is None:
+                page_html = fetch_with_options(
+                    fetcher,
+                    candidate.url,
+                    timeout=timeout,
+                    cafile=cafile,
+                    insecure_tls=insecure_tls,
+                )
+                page_cache[candidate.url] = page_html
+            candidate.item_count = len(parse_coupon_items(page_html))
+        except (OSError, urllib.error.URLError) as exc:
+            candidate.error = str(exc)
+            inspected.append(candidate)
+            continue
+
+        inspected.append(candidate)
+        if candidate.item_count:
+            selected_candidates.append(candidate)
+            page_html_by_url[candidate.url] = page_html
+
+    if selected_candidates:
+        primary_candidate = selected_candidates[0]
+        return PageDiscovery(
+            selected_url=primary_candidate.url,
+            html_text=page_html_by_url[primary_candidate.url],
+            start_urls=resolved_start_urls,
+            selected_candidate=primary_candidate,
+            selected_urls=[candidate.url for candidate in selected_candidates],
+            selected_candidates=selected_candidates,
+            inspected_candidates=inspected,
+            candidate_count=len(candidates),
+            page_html_by_url=page_html_by_url,
+        )
+
+    fallback_url = DEFAULT_PAGE_URL
+    fallback_html = page_cache.get(fallback_url)
+    if fallback_html is None:
+        fallback_html = fetch_with_options(
+            fetcher,
+            fallback_url,
+            timeout=timeout,
+            cafile=cafile,
+            insecure_tls=insecure_tls,
+        )
+
+    fallback_candidate = candidates_by_url.get(fallback_url) or CampaignCandidate(
+        url=fallback_url,
+        text="Fallback fixed Dospara coupon page",
+        score=score_campaign_link("PCパーツ 周辺機器 クーポン", fallback_url),
+        source_url="fallback",
+    )
+    fallback_candidate.item_count = len(parse_coupon_items(fallback_html))
+    if fallback_candidate not in inspected:
+        inspected.append(fallback_candidate)
+
+    return PageDiscovery(
+        selected_url=fallback_url,
+        html_text=fallback_html,
+        start_urls=resolved_start_urls,
+        selected_candidate=fallback_candidate,
+        selected_urls=[fallback_url],
+        selected_candidates=[fallback_candidate] if fallback_candidate.item_count else [],
+        inspected_candidates=inspected,
+        candidate_count=len(candidates),
+        page_html_by_url={fallback_url: fallback_html},
+        fallback_used=True,
+    )
+
+
 def chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
 
@@ -365,8 +707,44 @@ def extract_first_class_text(page_html: str, class_name: str) -> str | None:
     return text or None
 
 
+def apply_campaign_context(items: list[CouponItem], *, page_url: str, page_meta: dict[str, str | None]) -> None:
+    for item in items:
+        item.campaign_source_url = page_url
+        item.campaign_title = page_meta.get("title")
+        item.campaign_updated_text = page_meta.get("updated_text")
+        item.campaign_end_text = page_meta.get("campaign_end_text")
+
+
+def parse_coupon_items_from_pages(page_html_by_url: dict[str, str]) -> tuple[list[CouponItem], list[dict[str, Any]]]:
+    items: list[CouponItem] = []
+    pages: list[dict[str, Any]] = []
+
+    for page_url, page_html in page_html_by_url.items():
+        page_meta = extract_page_meta(page_html)
+        page_items = parse_coupon_items(page_html)
+        apply_campaign_context(page_items, page_url=page_url, page_meta=page_meta)
+        items.extend(page_items)
+        pages.append({"source_url": page_url, **page_meta, "count": len(page_items)})
+
+    return dedupe_coupon_items(items), pages
+
+
+def dedupe_coupon_items(items: list[CouponItem]) -> list[CouponItem]:
+    deduped: list[CouponItem] = []
+    seen: set[tuple[str, str | None, int]] = set()
+
+    for item in items:
+        dedupe_key = (item.product_id, item.coupon_code, item.coupon_discount_yen)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        deduped.append(item)
+
+    return deduped
+
+
 def get_dospara_coupon_prices(
-    page_url: str = DEFAULT_PAGE_URL,
+    page_url: str | None = AUTO_PAGE_URL,
     *,
     timeout: float = DEFAULT_TIMEOUT,
     batch_size: int = DEFAULT_BATCH_SIZE,
@@ -375,30 +753,64 @@ def get_dospara_coupon_prices(
     in_stock_only: bool = False,
     cafile: str | None = None,
     insecure_tls: bool = False,
+    discovery_start_urls: list[str] | None = None,
+    max_discovery_candidates: int = DEFAULT_MAX_DISCOVERY_CANDIDATES,
+    fetcher: Callable[..., str] = fetch_text,
 ) -> dict[str, Any]:
-    if html_text is None:
-        html_text = fetch_text(page_url, timeout=timeout, cafile=cafile, insecure_tls=insecure_tls)
+    discovery: PageDiscovery | None = None
+    resolved_page_url = DEFAULT_PAGE_URL if is_auto_page_url(page_url) else str(page_url)
+    page_html_by_url: dict[str, str] = {}
 
-    items = parse_coupon_items(html_text)
+    if html_text is None:
+        if is_auto_page_url(page_url):
+            discovery = discover_coupon_page(
+                start_urls=discovery_start_urls,
+                timeout=timeout,
+                cafile=cafile,
+                insecure_tls=insecure_tls,
+                max_candidates=max_discovery_candidates,
+                fetcher=fetcher,
+            )
+            resolved_page_url = discovery.selected_url
+            html_text = discovery.html_text
+            page_html_by_url = discovery.page_html_by_url
+        else:
+            html_text = fetch_with_options(
+                fetcher,
+                resolved_page_url,
+                timeout=timeout,
+                cafile=cafile,
+                insecure_tls=insecure_tls,
+            )
+            page_html_by_url = {resolved_page_url: html_text}
+    else:
+        page_html_by_url = {resolved_page_url: html_text}
+
+    items, pages = parse_coupon_items_from_pages(page_html_by_url)
     if fetch_prices and items:
         product_info = fetch_product_info(
             [item.product_id for item in items],
-            page_url=page_url,
+            page_url=resolved_page_url,
             timeout=timeout,
             batch_size=batch_size,
             cafile=cafile,
             insecure_tls=insecure_tls,
         )
-        enrich_items(items, product_info, page_url=page_url)
+        enrich_items(items, product_info, page_url=resolved_page_url)
 
     if in_stock_only:
         items = [item for item in items if "在庫なし" not in (item.stock or "")]
 
     records = [item.to_record() for item in items]
+    source_urls = list(page_html_by_url.keys())
+    primary_page = pages[0] if pages else {"source_url": resolved_page_url, **extract_page_meta(html_text)}
     return {
-        "source_url": page_url,
+        "source_url": resolved_page_url,
+        "source_urls": source_urls,
         "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "page": extract_page_meta(html_text),
+        "page": {key: value for key, value in primary_page.items() if key != "count"},
+        "pages": pages,
+        "discovery": discovery.to_record() if discovery else {"enabled": False},
         "count": len(records),
         "items": records,
     }
@@ -441,7 +853,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract Dospara regular prices, coupon discounts, and after-coupon prices.",
     )
-    parser.add_argument("url", nargs="?", default=DEFAULT_PAGE_URL, help="Dospara campaign page URL")
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default=AUTO_PAGE_URL,
+        help="Dospara campaign page URL, or 'auto' to discover the current coupon page",
+    )
     parser.add_argument(
         "-f",
         "--format",
@@ -455,6 +872,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--in-stock-only", action="store_true", help="Drop items whose stock text contains '在庫なし'")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Product API batch size")
+    parser.add_argument(
+        "--discovery-url",
+        action="append",
+        dest="discovery_urls",
+        help="Campaign index URL to scan when url is 'auto'. May be specified multiple times.",
+    )
+    parser.add_argument(
+        "--max-discovery-candidates",
+        type=int,
+        default=DEFAULT_MAX_DISCOVERY_CANDIDATES,
+        help="Maximum candidate campaign pages to inspect when url is 'auto'",
+    )
     parser.add_argument("--cafile", help="CA bundle path for TLS verification")
     parser.add_argument(
         "--insecure-tls",
@@ -493,6 +922,8 @@ def main(argv: list[str] | None = None) -> int:
             in_stock_only=args.in_stock_only,
             cafile=args.cafile,
             insecure_tls=args.insecure_tls,
+            discovery_start_urls=args.discovery_urls,
+            max_discovery_candidates=args.max_discovery_candidates,
         )
         rendered = render_result(result, args.format, indent=args.indent)
 

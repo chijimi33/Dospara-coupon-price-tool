@@ -1,6 +1,12 @@
 # Dospara coupon price tool
 
-`dospara_coupon_tool.py` extracts coupon products from:
+`dospara_coupon_tool.py` extracts coupon products from current Dospara PC parts/peripherals coupon campaigns.
+
+By default it scans the live campaign list first:
+
+https://www.dospara.co.jp/campaign-list
+
+Then it inspects likely campaign pages and aggregates every page that actually contains coupon products, including temporary campaigns such as settlement sales or DIY PC events. The previous fixed page is still used as a fallback when discovery finds no coupon pages:
 
 https://www.dospara.co.jp/event/diy_parts_accessory.html
 
@@ -15,11 +21,24 @@ The output includes:
 - `coupon_discount_yen`: coupon discount amount
 - `coupon_price_yen`: `regular_price_yen - coupon_discount_yen`
 - `coupon_code`
+- `campaign_source_url`: campaign page each item came from
+- `campaign_title`
+- `campaign_end_text`
+- `source_url`: primary campaign page for this run
+- `source_urls`: all campaign pages used for this run
+- `pages`: per-campaign metadata and item counts
+- `discovery`: inspected candidate pages and whether the fallback URL was used
 
 ## Usage
 
 ```bash
 python3 dospara_coupon_tool.py
+```
+
+Use a fixed campaign page instead of auto discovery:
+
+```bash
+python3 dospara_coupon_tool.py https://www.dospara.co.jp/event/diy_parts_accessory.html
 ```
 
 Output as CSV:
@@ -38,6 +57,12 @@ Only parse the HTML and skip the product API:
 
 ```bash
 python3 dospara_coupon_tool.py --no-api
+```
+
+Add another page to scan during auto discovery:
+
+```bash
+python3 dospara_coupon_tool.py auto --discovery-url https://www.dospara.co.jp/campaign-list
 ```
 
 If your local Python cannot find a CA bundle, specify one explicitly:
@@ -66,7 +91,7 @@ No third-party packages are required.
 
 ## GitHub Actions publishing
 
-The workflow in `.github/workflows/publish-dospara-coupons.yml` runs every 6 hours and commits static files under `public/`:
+The workflow in `.github/workflows/publish-dospara-coupons.yml` runs every 6 hours, auto-discovers current Dospara coupon campaign pages, and commits static files under `public/`:
 
 - `dospara_coupons.json`
 - `dospara_coupons.csv`
@@ -79,6 +104,14 @@ The JSON URL for ChatGPT Tasks is:
 ```text
 https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json
 ```
+
+When using this URL from ChatGPT Tasks, append a unique cache-busting query string for each run so the task does not reuse a stale fetched copy:
+
+```text
+https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json?cache_bust=YYYYMMDDHHmm
+```
+
+If `fetched_at` is more than 12 hours old, retry once with a new `cache_bust` value before treating the data as stale.
 
 After pushing this repository to GitHub, run `Update Dospara coupon data` once manually from the GitHub Actions tab.
 
