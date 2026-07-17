@@ -110,13 +110,37 @@ The workflow in `.github/workflows/publish-dospara-coupons.yml` runs every 6 hou
 
 It can also be started manually from the GitHub Actions tab with `workflow_dispatch`.
 
-The JSON URL for ChatGPT Tasks is:
+The primary JSON URL for ChatGPT Tasks is the rolling release asset:
+
+```text
+https://github.com/chijimi33/Dospara-coupon-price-tool/releases/download/dospara-coupons-latest/dospara_coupons.json
+```
+
+The workflow overwrites this asset on every successful run, so ChatGPT Tasks do not need to resolve the latest `main` commit through the GitHub API.
+
+Only notify Dospara coupon products when each item has:
+
+```json
+{
+  "coupon_verified": true
+}
+```
+
+Treat `coupon_verified: false`, `null`, or a missing field as not notification-eligible. If `coupon_verification.enabled` is missing or false at the top level, do not use coupon-only Dospara deals as confirmed notifications.
+
+The branch raw URL remains available as a fallback:
 
 ```text
 https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json
 ```
 
-For ChatGPT Tasks, the most reliable fetch flow is to resolve the current `main` commit first and then fetch the commit-pinned raw file. This avoids stale `raw.githubusercontent.com/.../main/...` cache responses:
+If the task must use the branch URL directly, append a unique cache-busting query string for each run:
+
+```text
+https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json?cache_bust=YYYYMMDDHHmm
+```
+
+If the release asset and branch fallback both fail, and the task can access the GitHub API, resolve the current `main` commit and fetch the commit-pinned raw file:
 
 ```text
 https://api.github.com/repos/chijimi33/Dospara-coupon-price-tool/git/ref/heads/main
@@ -128,13 +152,7 @@ Extract `object.sha`, then fetch:
 https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/{object.sha}/public/dospara_coupons.json
 ```
 
-If the task must use the branch URL directly, append a unique cache-busting query string for each run:
-
-```text
-https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json?cache_bust=YYYYMMDDHHmm
-```
-
-If `fetched_at` is more than 12 hours old, retry using the commit-pinned flow above before treating the data as stale.
+If `fetched_at` is more than 12 hours old, retry using the fallback URLs above before treating the data as stale. Do not use stale coupon data to resurrect coupons that are absent or unverified on the latest product-page verification run.
 
 After pushing this repository to GitHub, run `Update Dospara coupon data` once manually from the GitHub Actions tab.
 
