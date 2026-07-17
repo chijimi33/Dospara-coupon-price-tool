@@ -54,12 +54,16 @@ CSV_FIELDS = [
     "section",
     "product_id",
     "product_name",
+    "api_regular_price_yen",
     "regular_price_yen",
     "coupon_discount_yen",
     "coupon_price_yen",
     "coupon_code",
     "coupon_verified",
     "coupon_verification_error",
+    "product_page_regular_price_yen",
+    "product_page_stock",
+    "product_page_verified_at",
     "stock",
     "product_url",
 ]
@@ -98,6 +102,8 @@ class CouponItem:
     product_id: str
     coupon_code: str | None
     coupon_discount_yen: int
+    api_regular_price_yen: int | None = None
+    api_stock: str | None = None
     regular_price_yen: int | None = None
     coupon_price_yen: int | None = None
     product_name: str | None = None
@@ -113,6 +119,14 @@ class CouponItem:
     coupon_verification_error: str | None = None
     coupon_verification_source_url: str | None = None
     product_page_coupon_expire_text: str | None = None
+    coupon_expires_at: str | None = None
+    product_page_product_id: str | None = None
+    product_page_product_name: str | None = None
+    product_page_regular_price_yen: int | None = None
+    product_page_stock: str | None = None
+    product_page_verified_at: str | None = None
+    product_page_price_matches_api: bool | None = None
+    product_page_stock_matches_api: bool | None = None
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -123,6 +137,8 @@ class CouponItem:
             "section": self.section,
             "product_id": self.product_id,
             "product_name": self.product_name,
+            "api_regular_price_yen": self.api_regular_price_yen,
+            "api_stock": self.api_stock,
             "regular_price_yen": self.regular_price_yen,
             "coupon_discount_yen": self.coupon_discount_yen,
             "coupon_price_yen": self.coupon_price_yen,
@@ -131,6 +147,14 @@ class CouponItem:
             "coupon_verification_error": self.coupon_verification_error,
             "coupon_verification_source_url": self.coupon_verification_source_url,
             "product_page_coupon_expire_text": self.product_page_coupon_expire_text,
+            "coupon_expires_at": self.coupon_expires_at,
+            "product_page_product_id": self.product_page_product_id,
+            "product_page_product_name": self.product_page_product_name,
+            "product_page_regular_price_yen": self.product_page_regular_price_yen,
+            "product_page_stock": self.product_page_stock,
+            "product_page_verified_at": self.product_page_verified_at,
+            "product_page_price_matches_api": self.product_page_price_matches_api,
+            "product_page_stock_matches_api": self.product_page_stock_matches_api,
             "stock": self.stock,
             "product_url": self.product_url,
             "image_url": self.image_url,
@@ -165,6 +189,14 @@ class ProductPageCoupon:
     coupon_code: str
     campaign_key: str | None = None
     expire_text: str | None = None
+
+
+@dataclass
+class ProductPageSnapshot:
+    product_id: str | None
+    product_name: str | None
+    regular_price_yen: int | None
+    stock: str | None
 
 
 @dataclass
@@ -669,12 +701,14 @@ def enrich_items(
             continue
 
         regular_price = parse_int(info.get("amttax"))
+        item.api_regular_price_yen = regular_price
+        item.api_stock = blank_to_none(info.get("stkname"))
         item.regular_price_yen = regular_price
         item.coupon_price_yen = (
             max(regular_price - item.coupon_discount_yen, 0) if regular_price is not None else None
         )
         item.product_name = blank_to_none(info.get("pname"))
-        item.stock = blank_to_none(info.get("stkname"))
+        item.stock = item.api_stock
         item.product_url = absolute_url(info.get("url"), page_url)
         item.image_url = absolute_url(info.get("imgurl"), page_url)
         item.simple_spec = blank_to_none(info.get("simplespec"))
@@ -713,6 +747,47 @@ def extract_product_page_coupon(product_html: str, product_id: str) -> ProductPa
     return None
 
 
+def extract_product_page_snapshot(product_html: str) -> ProductPageSnapshot | None:
+    match = re.search(
+        r"\b(?:var|let|const)\s+productJson\s*=\s*(\{.*?\})\s*;?\s*</script>",
+        product_html,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+
+    try:
+        product = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    return ProductPageSnapshot(
+        product_id=blank_to_none(product.get("productID")),
+        product_name=blank_to_none(product.get("pname")),
+        regular_price_yen=parse_int(product.get("amttax")),
+        stock=blank_to_none(product.get("stkname")),
+    )
+
+
+def parse_japanese_coupon_expiry(expire_text: str | None) -> dt.datetime | None:
+    if not expire_text:
+        return None
+
+    match = re.search(
+        r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日(?:\([^)]*\))?\s*(\d{1,2}):(\d{2})",
+        expire_text,
+    )
+    if not match:
+        return None
+
+    year, month, day, hour, minute = (int(value) for value in match.groups())
+    jst = dt.timezone(dt.timedelta(hours=9))
+    try:
+        return dt.datetime(year, month, day, hour, minute, tzinfo=jst)
+    except ValueError:
+        return None
+
+
 def extract_product_map_string(script_body: str, field_name: str) -> str | None:
     match = re.search(rf"productMap\.{re.escape(field_name)}\s*=\s*['\"]([^'\"]+)['\"]", script_body)
     return match.group(1).strip() if match else None
@@ -733,8 +808,12 @@ def verify_product_page_coupons(
     cafile: str | None = None,
     insecure_tls: bool = False,
     fetcher: Callable[..., str] = fetch_text,
+    now: dt.datetime | None = None,
 ) -> list[CouponItem]:
     verified_items: list[CouponItem] = []
+    verification_time = now or dt.datetime.now(dt.timezone.utc)
+    if verification_time.tzinfo is None:
+        verification_time = verification_time.replace(tzinfo=dt.timezone.utc)
 
     for item in items:
         item.coupon_verified = False
@@ -759,6 +838,54 @@ def verify_product_page_coupons(
             item.coupon_verification_error = f"product page fetch failed: {exc}"
             continue
 
+        item.product_page_verified_at = verification_time.astimezone(dt.timezone.utc).isoformat()
+        snapshot = extract_product_page_snapshot(product_html)
+        if snapshot is None:
+            item.coupon_verification_error = "productJson not found on product page"
+            continue
+
+        item.product_page_product_id = snapshot.product_id
+        item.product_page_product_name = snapshot.product_name
+        item.product_page_regular_price_yen = snapshot.regular_price_yen
+        item.product_page_stock = snapshot.stock
+        item.product_page_price_matches_api = (
+            snapshot.regular_price_yen == item.api_regular_price_yen
+            if snapshot.regular_price_yen is not None and item.api_regular_price_yen is not None
+            else None
+        )
+        item.product_page_stock_matches_api = (
+            snapshot.stock == item.api_stock
+            if snapshot.stock is not None and item.api_stock is not None
+            else None
+        )
+
+        if snapshot.product_id != item.product_id:
+            item.coupon_verification_error = (
+                f"product ID mismatch: campaign={item.product_id}, product_page={snapshot.product_id}"
+            )
+            continue
+        if snapshot.regular_price_yen is None:
+            item.coupon_verification_error = "regular price missing from product page"
+            continue
+        if snapshot.regular_price_yen < item.coupon_discount_yen:
+            item.coupon_verification_error = (
+                f"coupon discount exceeds product page price: price={snapshot.regular_price_yen}, "
+                f"discount={item.coupon_discount_yen}"
+            )
+            continue
+        if snapshot.stock is None:
+            item.coupon_verification_error = "stock missing from product page"
+            continue
+        if "在庫なし" in snapshot.stock or "販売終了" in snapshot.stock:
+            item.coupon_verification_error = f"product unavailable on product page: {snapshot.stock}"
+            continue
+
+        item.regular_price_yen = snapshot.regular_price_yen
+        item.coupon_price_yen = snapshot.regular_price_yen - item.coupon_discount_yen
+        item.stock = snapshot.stock
+        if snapshot.product_name:
+            item.product_name = snapshot.product_name
+
         product_coupon = extract_product_page_coupon(product_html, item.product_id)
         if product_coupon is None:
             item.coupon_verification_error = "coupon not active on product page"
@@ -777,9 +904,22 @@ def verify_product_page_coupons(
             )
             continue
 
+        item.product_page_coupon_expire_text = product_coupon.expire_text
+        coupon_expires_at = parse_japanese_coupon_expiry(product_coupon.expire_text)
+        if coupon_expires_at is None:
+            item.coupon_verification_error = (
+                f"coupon expiry missing or invalid on product page: {product_coupon.expire_text}"
+            )
+            continue
+        item.coupon_expires_at = coupon_expires_at.isoformat()
+        if coupon_expires_at <= verification_time.astimezone(coupon_expires_at.tzinfo):
+            item.coupon_verification_error = (
+                f"coupon expired on product page: {product_coupon.expire_text}"
+            )
+            continue
+
         item.coupon_verified = True
         item.coupon_verification_error = None
-        item.product_page_coupon_expire_text = product_coupon.expire_text
         verified_items.append(item)
 
     return verified_items
@@ -995,6 +1135,14 @@ def get_dospara_coupon_prices(
             "enabled": verification_enabled,
             "source": "product_page",
             "strict": verification_enabled,
+            "checks": [
+                "product_id",
+                "regular_price_yen",
+                "stock",
+                "coupon_code",
+                "coupon_discount_yen",
+                "coupon_expiry",
+            ],
             "parsed_item_count": parsed_item_count,
             "verified_item_count": verified_item_count,
             "rejected_item_count": len(rejected_items),

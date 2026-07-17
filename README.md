@@ -18,6 +18,7 @@ It joins two sources on the page:
 The output includes:
 
 - `regular_price_yen`: normal tax-included price shown by Dospara
+- `api_regular_price_yen`: price returned by Dospara's product API before product-page verification
 - `coupon_discount_yen`: coupon discount amount
 - `coupon_price_yen`: `regular_price_yen - coupon_discount_yen`
 - `coupon_code`
@@ -26,13 +27,18 @@ The output includes:
 - `campaign_end_text`
 - `coupon_verified`: `true` only when the same coupon is active on the product page
 - `coupon_verification_error`: reason a parsed campaign card was rejected, included under `coupon_verification.rejected_items`
+- `product_page_regular_price_yen`: current `productJson.amttax` value read from the product page
+- `product_page_stock`: current `productJson.stkname` value read from the product page
+- `product_page_verified_at`: timestamp for the product-page snapshot
+- `product_page_price_matches_api`: whether the product API and product-page prices matched during the run
+- `coupon_expires_at`: machine-readable coupon deadline when the product page supplies a full date
 - `source_url`: primary campaign page for this run
 - `source_urls`: all campaign pages used for this run
 - `pages`: per-campaign metadata and item counts
 - `coupon_verification`: product-page verification summary
 - `discovery`: inspected candidate pages and whether the fallback URL was used
 
-Campaign pages can retain stale coupon cards after a quantity-limited coupon ends. By default the tool verifies every parsed campaign coupon against the product page and only outputs items where the product page still contains the same active product ID, coupon code, and discount amount. Rejected stale cards are reported in `coupon_verification.rejected_items`.
+Campaign pages can retain stale coupon cards after a quantity-limited coupon ends. By default the tool verifies every parsed campaign coupon against the product page and only outputs items where the product page still contains the same active product ID, coupon code, discount amount, current price, stock state, and unexpired deadline. The product-page price and stock become the final values; the earlier product API values remain in `api_regular_price_yen` and `api_stock` for discrepancy reporting. Rejected stale cards are reported in `coupon_verification.rejected_items`.
 
 ## Usage
 
@@ -127,6 +133,8 @@ Only notify Dospara coupon products when each item has:
 ```
 
 Treat `coupon_verified: false`, `null`, or a missing field as not notification-eligible. If `coupon_verification.enabled` is missing or false at the top level, do not use coupon-only Dospara deals as confirmed notifications.
+
+For a fresh item with `coupon_verified: true`, `product_page_product_id` matching `product_id`, and a recent `product_page_verified_at`, the JSON already contains a successful product-page check performed by GitHub Actions. A ChatGPT Task that cannot reopen the same product page may report that limitation, but it does not need to turn the entire run into a monitoring error or discard the item. Only a newer, directly fetched official product page with contradictory structured product data should override this snapshot; search snippets and cached page text are not sufficient.
 
 The branch raw URL remains available as a fallback:
 

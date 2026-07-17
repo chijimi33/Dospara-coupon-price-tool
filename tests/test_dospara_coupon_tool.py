@@ -1,3 +1,4 @@
+import datetime as dt
 import unittest
 
 from dospara_coupon_tool import (
@@ -70,6 +71,9 @@ class DosparaCouponToolTest(unittest.TestCase):
         pages = {
             "https://www.dospara.co.jp/SBR1/IC111111.html": """
             <script>
+              var productJson = {"productID":"IC111111","pname":"Active Product","amttax":19800,"stkname":"24時間以内に出荷"};
+            </script>
+            <script>
               switch (productJson.productID) {
                 case 'IC111111':
                   productMap.amount = '5000';
@@ -83,6 +87,9 @@ class DosparaCouponToolTest(unittest.TestCase):
             </script>
             """,
             "https://www.dospara.co.jp/SBR1/IC222222.html": """
+            <script>
+              var productJson = {"productID":"IC222222","pname":"Ended Product","amttax":9800,"stkname":"24時間以内に出荷"};
+            </script>
             <script>
               switch (productJson.productID) {
                 // case 'IC222222':
@@ -206,13 +213,113 @@ class DosparaCouponToolTest(unittest.TestCase):
         }
 
         enrich_items(items, product_info, page_url="https://www.dospara.co.jp/event/example.html")
-        verified_items = verify_product_page_coupons(items, fetcher=self.fake_product_page_fetcher)
+        verified_items = verify_product_page_coupons(
+            items,
+            fetcher=self.fake_product_page_fetcher,
+            now=dt.datetime(2026, 7, 17, 6, 0, tzinfo=dt.timezone.utc),
+        )
 
         self.assertEqual([item.product_id for item in verified_items], ["IC111111"])
         self.assertTrue(verified_items[0].coupon_verified)
         self.assertEqual(verified_items[0].product_page_coupon_expire_text, "2026年7月17日(金) 16:59")
+        self.assertEqual(verified_items[0].product_page_regular_price_yen, 19800)
+        self.assertEqual(verified_items[0].product_page_stock, "24時間以内に出荷")
+        self.assertEqual(verified_items[0].coupon_expires_at, "2026-07-17T16:59:00+09:00")
         self.assertFalse(items[1].coupon_verified)
         self.assertEqual(items[1].coupon_verification_error, "coupon not active on product page")
+
+    def test_product_page_snapshot_overrides_stale_api_price(self):
+        items = parse_coupon_items(
+            """
+            <li class="model-card get_product_data" data-code="IC333333">
+              <div class="coupon-wrapper coupon-2000">
+                <div class="coupon-code__text">CURRENT</div>
+              </div>
+            </li>
+            """
+        )
+        enrich_items(
+            items,
+            {
+                "IC333333": {
+                    "productID": "IC333333",
+                    "pname": "API Product Name",
+                    "amttax": 12980,
+                    "stkname": "残りわずか",
+                    "url": "/SBR1/IC333333.html",
+                }
+            },
+            page_url="https://www.dospara.co.jp/event/example.html",
+        )
+
+        def fetch_product_page(_url, **_kwargs):
+            return """
+            <script>
+              var productJson = {"productID":"IC333333","pname":"Current Product Name","amttax":10980,"stkname":"24時間以内に出荷"};
+            </script>
+            <script>
+              const campaignExpire = {"campaign-weekly":"2026年7月24日(金)10:59"};
+              switch (productJson.productID) {
+                case 'IC333333':
+                  productMap.amount = '2000';
+                  productMap.couponcode = 'CURRENT';
+                  productMap.campaign = 'campaign-weekly';
+                  break;
+              }
+            </script>
+            """
+
+        verified_items = verify_product_page_coupons(
+            items,
+            fetcher=fetch_product_page,
+            now=dt.datetime(2026, 7, 17, 8, 0, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(len(verified_items), 1)
+        record = verified_items[0].to_record()
+        self.assertEqual(record["api_regular_price_yen"], 12980)
+        self.assertEqual(record["product_page_regular_price_yen"], 10980)
+        self.assertFalse(record["product_page_price_matches_api"])
+        self.assertEqual(record["regular_price_yen"], 10980)
+        self.assertEqual(record["coupon_price_yen"], 8980)
+        self.assertEqual(record["stock"], "24時間以内に出荷")
+
+    def test_expired_product_page_coupon_is_rejected(self):
+        items = parse_coupon_items(
+            """
+            <li class="model-card get_product_data" data-code="IC111111">
+              <div class="coupon-wrapper coupon-5000">
+                <div class="coupon-code__text">LIVEA</div>
+              </div>
+            </li>
+            """
+        )
+        enrich_items(
+            items,
+            {
+                "IC111111": {
+                    "productID": "IC111111",
+                    "pname": "Active Product",
+                    "amttax": 19800,
+                    "stkname": "24時間以内に出荷",
+                    "url": "/SBR1/IC111111.html",
+                }
+            },
+            page_url="https://www.dospara.co.jp/event/example.html",
+        )
+
+        verified_items = verify_product_page_coupons(
+            items,
+            fetcher=self.fake_product_page_fetcher,
+            now=dt.datetime(2026, 7, 17, 8, 0, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(verified_items, [])
+        self.assertFalse(items[0].coupon_verified)
+        self.assertEqual(
+            items[0].coupon_verification_error,
+            "coupon expired on product page: 2026年7月17日(金) 16:59",
+        )
 
     def test_discover_coupon_page_selects_current_campaign_from_campaign_list(self):
         discovery = discover_coupon_page(
