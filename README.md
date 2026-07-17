@@ -116,13 +116,13 @@ The workflow in `.github/workflows/publish-dospara-coupons.yml` runs every 6 hou
 
 It can also be started manually from the GitHub Actions tab with `workflow_dispatch`.
 
-The primary JSON URL for ChatGPT Tasks is the rolling release asset:
+The primary JSON URL for ChatGPT Tasks is the branch raw file with a unique cache-busting query on every run:
 
 ```text
-https://github.com/chijimi33/Dospara-coupon-price-tool/releases/download/dospara-coupons-latest/dospara_coupons.json
+https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json?cache_bust=YYYYMMDDHHmm
 ```
 
-The workflow overwrites this asset on every successful run, so ChatGPT Tasks do not need to resolve the latest `main` commit through the GitHub API.
+Some ChatGPT retrieval environments reject the redirect used by GitHub Release downloads. The raw URL with a per-run query avoids that redirect while still bypassing stale branch responses.
 
 Only notify Dospara coupon products when each item has:
 
@@ -136,16 +136,16 @@ Treat `coupon_verified: false`, `null`, or a missing field as not notification-e
 
 For a fresh item with `coupon_verified: true`, `product_page_product_id` matching `product_id`, and a recent `product_page_verified_at`, the JSON already contains a successful product-page check performed by GitHub Actions. A ChatGPT Task that cannot reopen the same product page may report that limitation, but it does not need to turn the entire run into a monitoring error or discard the item. Only a newer, directly fetched official product page with contradictory structured product data should override this snapshot; search snippets and cached page text are not sufficient.
 
-The branch raw URL remains available as a fallback:
+The workflow also overwrites a rolling release asset on every successful run. Use it as the first fallback:
+
+```text
+https://github.com/chijimi33/Dospara-coupon-price-tool/releases/download/dospara-coupons-latest/dospara_coupons.json
+```
+
+The branch URL without a query remains available for manual checks, but Tasks should not use it as the only route because an intermediary may cache it:
 
 ```text
 https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json
-```
-
-If the task must use the branch URL directly, append a unique cache-busting query string for each run:
-
-```text
-https://raw.githubusercontent.com/chijimi33/Dospara-coupon-price-tool/main/public/dospara_coupons.json?cache_bust=YYYYMMDDHHmm
 ```
 
 If the release asset and branch fallback both fail, and the task can access the GitHub API, resolve the current `main` commit and fetch the commit-pinned raw file:
