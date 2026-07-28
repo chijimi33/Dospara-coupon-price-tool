@@ -33,6 +33,7 @@ DEFAULT_DISCOVERY_START_URLS = [
 DEFAULT_TIMEOUT = 20.0
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_DISCOVERY_CANDIDATES = 24
+COUPON_REMAINS_URL = "https://www.dospara.co.jp/api/getCouponRemains"
 DISCOVERY_MIN_SCORE = 35
 COMMON_CA_BUNDLES = [
     "/etc/ssl/cert.pem",
@@ -58,7 +59,11 @@ CSV_FIELDS = [
     "regular_price_yen",
     "coupon_discount_yen",
     "coupon_price_yen",
+    "coupon_id",
     "coupon_code",
+    "coupon_remaining",
+    "coupon_remaining_verified",
+    "coupon_remaining_checked_at",
     "coupon_verified",
     "coupon_verification_error",
     "product_page_regular_price_yen",
@@ -102,6 +107,10 @@ class CouponItem:
     product_id: str
     coupon_code: str | None
     coupon_discount_yen: int
+    coupon_id: str | None = None
+    coupon_remaining: int | None = None
+    coupon_remaining_verified: bool | None = None
+    coupon_remaining_checked_at: str | None = None
     api_regular_price_yen: int | None = None
     api_stock: str | None = None
     regular_price_yen: int | None = None
@@ -142,7 +151,11 @@ class CouponItem:
             "regular_price_yen": self.regular_price_yen,
             "coupon_discount_yen": self.coupon_discount_yen,
             "coupon_price_yen": self.coupon_price_yen,
+            "coupon_id": self.coupon_id,
             "coupon_code": self.coupon_code,
+            "coupon_remaining": self.coupon_remaining,
+            "coupon_remaining_verified": self.coupon_remaining_verified,
+            "coupon_remaining_checked_at": self.coupon_remaining_checked_at,
             "coupon_verified": self.coupon_verified,
             "coupon_verification_error": self.coupon_verification_error,
             "coupon_verification_source_url": self.coupon_verification_source_url,
@@ -187,6 +200,7 @@ class ProductPageCoupon:
     product_id: str
     amount_yen: int
     coupon_code: str
+    coupon_id: str | None = None
     campaign_key: str | None = None
     expire_text: str | None = None
 
@@ -351,6 +365,18 @@ def extract_coupon_code(card_html: str) -> str | None:
     return code or None
 
 
+def extract_coupon_id(card_html: str) -> str | None:
+    wrapper_match = re.search(
+        r'<div\b[^>]*class=["\'][^"\']*coupon-wrapper[^"\']*["\'][^>]*>',
+        card_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not wrapper_match:
+        return None
+
+    return blank_to_none(parse_attrs(wrapper_match.group(0)).get("data-coupon-id"))
+
+
 def parse_coupon_items(page_html: str) -> list[CouponItem]:
     markup = strip_html_comments(page_html)
     items: list[CouponItem] = []
@@ -386,6 +412,7 @@ def parse_coupon_items(page_html: str) -> list[CouponItem]:
             CouponItem(
                 section=extract_section_title(markup, match.start()),
                 product_id=product_id,
+                coupon_id=extract_coupon_id(card_html),
                 coupon_code=coupon_code,
                 coupon_discount_yen=discount,
             )
@@ -740,6 +767,7 @@ def extract_product_page_coupon(product_html: str, product_id: str) -> ProductPa
             product_id=product_id,
             amount_yen=int(amount_match.group(1)),
             coupon_code=code_match.group(1).strip(),
+            coupon_id=extract_product_map_string(body, "id"),
             campaign_key=campaign_key,
             expire_text=extract_campaign_expire_text(script_text, campaign_key),
         )
@@ -904,6 +932,14 @@ def verify_product_page_coupons(
             )
             continue
 
+        if item.coupon_id and product_coupon.coupon_id and product_coupon.coupon_id != item.coupon_id:
+            item.coupon_verification_error = (
+                f"coupon ID mismatch: campaign={item.coupon_id}, product_page={product_coupon.coupon_id}"
+            )
+            continue
+        if product_coupon.coupon_id:
+            item.coupon_id = product_coupon.coupon_id
+
         item.product_page_coupon_expire_text = product_coupon.expire_text
         coupon_expires_at = parse_japanese_coupon_expiry(product_coupon.expire_text)
         if coupon_expires_at is None:
@@ -923,6 +959,120 @@ def verify_product_page_coupons(
         verified_items.append(item)
 
     return verified_items
+
+
+def verify_coupon_remaining(
+    items: list[CouponItem],
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    cafile: str | None = None,
+    insecure_tls: bool = False,
+    fetcher: Callable[..., str] = fetch_text,
+    now: dt.datetime | None = None,
+) -> tuple[list[CouponItem], dict[str, Any]]:
+    verification_time = now or dt.datetime.now(dt.timezone.utc)
+    if verification_time.tzinfo is None:
+        verification_time = verification_time.replace(tzinfo=dt.timezone.utc)
+    checked_at = verification_time.astimezone(dt.timezone.utc).isoformat()
+
+    candidates: list[CouponItem] = []
+    missing_id_count = 0
+    for item in items:
+        item.coupon_remaining_checked_at = checked_at
+        if not item.coupon_id:
+            item.coupon_verified = False
+            item.coupon_remaining_verified = False
+            item.coupon_verification_error = "missing coupon_id for remaining check"
+            missing_id_count += 1
+            continue
+        candidates.append(item)
+
+    requested = list(
+        {
+            (item.coupon_id, item.coupon_code): {
+                "id": item.coupon_id,
+                "code": item.coupon_code,
+            }
+            for item in candidates
+        }.values()
+    )
+
+    response_by_coupon: dict[tuple[str, str], int] = {}
+    if requested:
+        payload = json.dumps({"coupons": requested}, ensure_ascii=False).encode("utf-8")
+        try:
+            raw = fetcher(
+                COUPON_REMAINS_URL,
+                timeout=timeout,
+                data=payload,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": "https://www.dospara.co.jp",
+                    "Referer": items[0].campaign_source_url or DEFAULT_PAGE_URL,
+                },
+                cafile=cafile,
+                insecure_tls=insecure_tls,
+            )
+            response = json.loads(raw)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Dospara coupon remaining API failed: {exc}") from exc
+
+        if response.get("returnCode") != "000000":
+            message = response.get("errorMsg") or "unknown error"
+            raise RuntimeError(f"Dospara coupon remaining API returned an error: {message}")
+
+        for line in response.get("couponRemains") or []:
+            coupon_id = blank_to_none(line.get("id"))
+            coupon_code = blank_to_none(line.get("code"))
+            remaining = parse_remaining_count(line.get("remain"))
+            if coupon_id and coupon_code and remaining is not None:
+                response_by_coupon[(coupon_id, coupon_code)] = remaining
+
+    verified_items: list[CouponItem] = []
+    ended_count = 0
+    missing_response_count = 0
+    for item in candidates:
+        key = (item.coupon_id or "", item.coupon_code or "")
+        remaining = response_by_coupon.get(key)
+        item.coupon_remaining = remaining
+
+        if remaining is None:
+            item.coupon_verified = False
+            item.coupon_remaining_verified = False
+            item.coupon_verification_error = "coupon missing from remaining API response"
+            missing_response_count += 1
+            continue
+        if remaining == 0:
+            item.coupon_verified = False
+            item.coupon_remaining_verified = False
+            item.coupon_verification_error = f"coupon distribution ended: remain={remaining}"
+            ended_count += 1
+            continue
+
+        item.coupon_remaining_verified = True
+        verified_items.append(item)
+
+    return verified_items, {
+        "enabled": True,
+        "source_url": COUPON_REMAINS_URL,
+        "checked_at": checked_at,
+        "requested_count": len(requested),
+        "available_count": len(verified_items),
+        "ended_count": ended_count,
+        "missing_id_count": missing_id_count,
+        "missing_response_count": missing_response_count,
+    }
+
+
+def parse_remaining_count(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+
+    text = str(value).strip()
+    return int(text) if re.fullmatch(r"-?\d+", text) else None
 
 
 def parse_int(value: Any) -> int | None:
@@ -1099,14 +1249,25 @@ def get_dospara_coupon_prices(
     verification_enabled = bool(fetch_prices and verify_product_page_coupons_enabled and items)
     verified_item_count = 0
     rejected_items: list[CouponItem] = []
+    remaining_verification: dict[str, Any] = {"enabled": False}
     if verification_enabled:
         parsed_items = items
-        items = verify_product_page_coupons(
+        verification_time = dt.datetime.now(dt.timezone.utc)
+        product_page_verified_items = verify_product_page_coupons(
             items,
             timeout=timeout,
             cafile=cafile,
             insecure_tls=insecure_tls,
             fetcher=fetcher,
+            now=verification_time,
+        )
+        items, remaining_verification = verify_coupon_remaining(
+            product_page_verified_items,
+            timeout=timeout,
+            cafile=cafile,
+            insecure_tls=insecure_tls,
+            fetcher=fetcher,
+            now=verification_time,
         )
         verified_item_count = len(items)
         rejected_items = [item for item in parsed_items if item.coupon_verified is not True]
@@ -1133,7 +1294,7 @@ def get_dospara_coupon_prices(
         "discovery": discovery.to_record() if discovery else {"enabled": False},
         "coupon_verification": {
             "enabled": verification_enabled,
-            "source": "product_page",
+            "source": "product_page_and_coupon_remaining_api",
             "strict": verification_enabled,
             "checks": [
                 "product_id",
@@ -1142,7 +1303,9 @@ def get_dospara_coupon_prices(
                 "coupon_code",
                 "coupon_discount_yen",
                 "coupon_expiry",
+                "coupon_remaining",
             ],
+            "remaining": remaining_verification,
             "parsed_item_count": parsed_item_count,
             "verified_item_count": verified_item_count,
             "rejected_item_count": len(rejected_items),

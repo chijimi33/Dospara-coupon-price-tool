@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import unittest
 
 from dospara_coupon_tool import (
@@ -8,6 +9,7 @@ from dospara_coupon_tool import (
     extract_product_page_coupon,
     get_dospara_coupon_prices,
     parse_coupon_items,
+    verify_coupon_remaining,
     verify_product_page_coupons,
 )
 
@@ -79,6 +81,7 @@ class DosparaCouponToolTest(unittest.TestCase):
                   productMap.amount = '5000';
                   productMap.couponcode = 'LIVEA';
                   productMap.campaign = 'campaign-weekly';
+                  productMap.id = 'WEEKLY-LIVE-A';
                   break;
               }
               const campaignDeadlines = {
@@ -116,7 +119,7 @@ class DosparaCouponToolTest(unittest.TestCase):
         </li>
         -->
         <li class="model-card get_product_data" data-code="IC111111">
-          <div class="coupon-wrapper coupon-5000">
+          <div class="coupon-wrapper coupon-5000" data-coupon-id="WEEKLY-LIVE-A">
             <div class="coupon-code__text">LIVEA</div>
           </div>
         </li>
@@ -133,6 +136,7 @@ class DosparaCouponToolTest(unittest.TestCase):
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0].product_id, "IC111111")
         self.assertEqual(items[0].coupon_discount_yen, 5000)
+        self.assertEqual(items[0].coupon_id, "WEEKLY-LIVE-A")
         self.assertEqual(items[0].coupon_code, "LIVEA")
         self.assertEqual(items[0].section, "Limited items")
         self.assertEqual(items[1].section, "Weekly coupons")
@@ -178,6 +182,7 @@ class DosparaCouponToolTest(unittest.TestCase):
         self.assertIsNotNone(active_coupon)
         self.assertEqual(active_coupon.amount_yen, 5000)
         self.assertEqual(active_coupon.coupon_code, "LIVEA")
+        self.assertEqual(active_coupon.coupon_id, "WEEKLY-LIVE-A")
         self.assertEqual(active_coupon.expire_text, "2026年7月17日(金) 16:59")
         self.assertIsNone(ended_coupon)
 
@@ -320,6 +325,87 @@ class DosparaCouponToolTest(unittest.TestCase):
             items[0].coupon_verification_error,
             "coupon expired on product page: 2026年7月17日(金) 16:59",
         )
+
+    def test_coupon_remaining_api_drops_exhausted_coupon(self):
+        items = parse_coupon_items(
+            """
+            <li class="model-card get_product_data" data-code="IC111111">
+              <div class="coupon-wrapper coupon-5000" data-coupon-id="COUPON-A">
+                <div class="coupon-code__text">LIVEA</div>
+              </div>
+            </li>
+            <li class="model-card get_product_data" data-code="IC222222">
+              <div class="coupon-wrapper coupon-1000" data-coupon-id="COUPON-B">
+                <div class="coupon-code__text">LIVEB</div>
+              </div>
+            </li>
+            <li class="model-card get_product_data" data-code="IC333333">
+              <div class="coupon-wrapper coupon-1000" data-coupon-id="COUPON-C">
+                <div class="coupon-code__text">LIVE-C-NO-LIMIT</div>
+              </div>
+            </li>
+            """
+        )
+        for item in items:
+            item.coupon_verified = True
+            item.campaign_source_url = self.CURRENT_COUPON_URL
+
+        def fetch_remaining(url, **kwargs):
+            self.assertEqual(url, "https://www.dospara.co.jp/api/getCouponRemains")
+            self.assertEqual(kwargs["method"], "POST")
+            payload = json.loads(kwargs["data"])
+            self.assertEqual(len(payload["coupons"]), 3)
+            return json.dumps(
+                {
+                    "returnCode": "000000",
+                    "couponRemains": [
+                        {"id": "COUPON-A", "code": "LIVEA", "remain": 11},
+                        {"id": "COUPON-B", "code": "LIVEB", "remain": 0},
+                        {"id": "COUPON-C", "code": "LIVE-C-NO-LIMIT", "remain": -1},
+                    ],
+                }
+            )
+
+        verified_items, summary = verify_coupon_remaining(
+            items,
+            fetcher=fetch_remaining,
+            now=dt.datetime(2026, 7, 28, 3, 0, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(
+            [item.product_id for item in verified_items],
+            ["IC111111", "IC333333"],
+        )
+        self.assertEqual(items[0].coupon_remaining, 11)
+        self.assertTrue(items[0].coupon_remaining_verified)
+        self.assertTrue(items[0].coupon_verified)
+        self.assertEqual(items[1].coupon_remaining, 0)
+        self.assertFalse(items[1].coupon_remaining_verified)
+        self.assertFalse(items[1].coupon_verified)
+        self.assertEqual(items[1].coupon_verification_error, "coupon distribution ended: remain=0")
+        self.assertEqual(items[2].coupon_remaining, -1)
+        self.assertTrue(items[2].coupon_remaining_verified)
+        self.assertTrue(items[2].coupon_verified)
+        self.assertEqual(summary["available_count"], 2)
+        self.assertEqual(summary["ended_count"], 1)
+
+    def test_coupon_remaining_api_failure_stops_verification(self):
+        items = parse_coupon_items(
+            """
+            <li class="model-card get_product_data" data-code="IC111111">
+              <div class="coupon-wrapper coupon-5000" data-coupon-id="COUPON-A">
+                <div class="coupon-code__text">LIVEA</div>
+              </div>
+            </li>
+            """
+        )
+        items[0].coupon_verified = True
+
+        def fail_fetch(_url, **_kwargs):
+            raise OSError("temporary failure")
+
+        with self.assertRaisesRegex(RuntimeError, "coupon remaining API failed"):
+            verify_coupon_remaining(items, fetcher=fail_fetch)
 
     def test_discover_coupon_page_selects_current_campaign_from_campaign_list(self):
         discovery = discover_coupon_page(

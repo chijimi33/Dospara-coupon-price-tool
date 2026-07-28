@@ -21,11 +21,15 @@ The output includes:
 - `api_regular_price_yen`: price returned by Dospara's product API before product-page verification
 - `coupon_discount_yen`: coupon discount amount
 - `coupon_price_yen`: `regular_price_yen - coupon_discount_yen`
+- `coupon_id`: internal coupon identifier used by Dospara's remaining-quantity API
 - `coupon_code`
+- `coupon_remaining`: current API value; `0` means ended and `-1` means active without a quantity limit
+- `coupon_remaining_verified`: `true` only when the remaining-quantity API returned a nonzero value
+- `coupon_remaining_checked_at`: timestamp for the remaining-quantity check
 - `campaign_source_url`: campaign page each item came from
 - `campaign_title`
 - `campaign_end_text`
-- `coupon_verified`: `true` only when the same coupon is active on the product page
+- `coupon_verified`: `true` only when the same coupon is active on the product page and its remaining quantity is nonzero
 - `coupon_verification_error`: reason a parsed campaign card was rejected, included under `coupon_verification.rejected_items`
 - `product_page_regular_price_yen`: current `productJson.amttax` value read from the product page
 - `product_page_stock`: current `productJson.stkname` value read from the product page
@@ -38,7 +42,9 @@ The output includes:
 - `coupon_verification`: product-page verification summary
 - `discovery`: inspected candidate pages and whether the fallback URL was used
 
-Campaign pages can retain stale coupon cards after a quantity-limited coupon ends. By default the tool verifies every parsed campaign coupon against the product page and only outputs items where the product page still contains the same active product ID, coupon code, discount amount, current price, stock state, and unexpired deadline. The product-page price and stock become the final values; the earlier product API values remain in `api_regular_price_yen` and `api_stock` for discrepancy reporting. Rejected stale cards are reported in `coupon_verification.rejected_items`.
+Campaign and product pages can retain coupon text after a quantity-limited coupon ends. By default the tool verifies every parsed coupon against both the product page and Dospara's `/api/getCouponRemains` endpoint. It only outputs items where the product page still contains the same active product ID, coupon ID, coupon code, discount amount, current price, stock state, and unexpired deadline, and where the remaining API value is not `0`. Dospara uses `-1` for an active coupon without a quantity limit, so that value is accepted. The product-page price and stock become the final values; the earlier product API values remain in `api_regular_price_yen` and `api_stock` for discrepancy reporting. Rejected stale cards are reported in `coupon_verification.rejected_items`.
+
+The remaining-quantity check is fail-closed. If the endpoint cannot be reached, returns an error, or omits a requested coupon, the run does not publish that coupon as verified.
 
 ## Usage
 
@@ -128,11 +134,13 @@ Only notify Dospara coupon products when each item has:
 
 ```json
 {
-  "coupon_verified": true
+  "coupon_verified": true,
+  "coupon_remaining_verified": true,
+  "coupon_remaining": 1
 }
 ```
 
-Treat `coupon_verified: false`, `null`, or a missing field as not notification-eligible. If `coupon_verification.enabled` is missing or false at the top level, do not use coupon-only Dospara deals as confirmed notifications.
+`coupon_remaining` may be any nonzero integer; `-1` is Dospara's active, quantity-unlimited value. Treat `coupon_verified` or `coupon_remaining_verified` being false, null, or missing, and `coupon_remaining: 0`, as not notification-eligible. If `coupon_verification.enabled` or `coupon_verification.remaining.enabled` is missing or false at the top level, do not use coupon-only Dospara deals as confirmed notifications.
 
 For a fresh item with `coupon_verified: true`, `product_page_product_id` matching `product_id`, and a recent `product_page_verified_at`, the JSON already contains a successful product-page check performed by GitHub Actions. A ChatGPT Task that cannot reopen the same product page may report that limitation, but it does not need to turn the entire run into a monitoring error or discard the item. Only a newer, directly fetched official product page with contradictory structured product data should override this snapshot; search snippets and cached page text are not sufficient.
 

@@ -39,6 +39,7 @@ def render_index(result: dict[str, Any]) -> str:
     page = result.get("page") or {}
     pages = result.get("pages") or []
     verification = result.get("coupon_verification") or {}
+    remaining = verification.get("remaining") or {}
     items = result.get("items") or []
     sample_rows = "\n".join(render_item_row(item) for item in items[:10])
 
@@ -67,6 +68,9 @@ def render_index(result: dict[str, Any]) -> str:
     <li>Campaign end text: {escape(page.get("campaign_end_text"))}</li>
     <li>Item count: {len(items)}</li>
     <li>Product-page coupon verification: {escape("enabled" if verification.get("enabled") else "disabled")}</li>
+    <li>Coupon remaining API: {escape("enabled" if remaining.get("enabled") else "disabled")}</li>
+    <li>Coupons still available: {escape(remaining.get("available_count", 0))}</li>
+    <li>Coupons ended by quantity limit: {escape(remaining.get("ended_count", 0))}</li>
     <li>Rejected stale coupon cards: {escape(verification.get("rejected_item_count", 0))}</li>
   </ul>
   {render_source_list(pages)}
